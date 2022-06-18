@@ -1,0 +1,90 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "ECSClusterArn"
+        Parameters:
+          - ECSClusterArn
+      - Label:
+          default: "ECSMetricNamespace"
+        Parameters:
+          - ECSMetricNamespace
+
+Parameters:
+  ECSClusterArn:
+    Type: String
+  ECSMetricNamespace:
+    Type: String
+
+Resources:
+  ResourcePolicyForEventsToLogs:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: "ECSEvents-ToLogs-ResourcePolicy"
+      PolicyDocument: !Sub 
+        - |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "events.amazonaws.com"
+                },
+                "Action": [
+                  "logs:CreateLogStream",
+                  "logs:PutLogEvents"
+                ],
+                "Resource": "${CloudWatchLogsLogGroupArn}"
+              }
+            ]
+          }
+        - CloudWatchLogsLogGroupArn: !GetAtt ECSEventsLogGroup.Arn
+
+  ECSEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/events/ECSEvents
+
+  ECSEventsRule:
+    Type: AWS::Events::Rule
+    DependsOn: ResourcePolicyForEventsToLogs
+    Properties:
+      Name: ECSEventsToLogs
+      Description: "Transfer ECSEvents to CloudWatch Logs"
+      State: ENABLED
+      EventPattern: { "source": ["aws.ecs"] }
+      Targets:
+        - Arn: !GetAtt ECSEventsLogGroup.Arn
+          Id: !Sub "ECSEventsLogGroup"
+
+  TaskExitEventsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: !Sub
+        - '{ ($.detail.clusterArn = "${ECSClusterArn}") && ($.detail-type = "ECS Task State Change") && ($.detail.desiredStatus = "STOPPED") && ( ($.detail.stoppedReason = "Essential container in task exited") || ($.detail.stoppedReason = "Task failed container health checks") || ($.detail.stoppedReason.prefix = "Task failed ELB health checks") ) }'
+        - ECSClusterArn: !Ref ECSClusterArn
+      LogGroupName: !Ref ECSEventsLogGroup
+      MetricTransformations:
+        - MetricName: "ECS-TaskExitEvents"
+          MetricNamespace: !Ref ECSMetricNamespace
+          MetricValue: "1"
+
+  TaskExitEventsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: ECS-TaskExitEvents-Alarm
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref SNSTopic
+      MetricName: "ECS-TaskExitEvents"
+      Namespace: !Ref ECSMetricNamespace
+      Statistic: "Sum"
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: "GreaterThanOrEqualToThreshold"
+      TreatMissingData: "notBreaching"
